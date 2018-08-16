@@ -43,6 +43,44 @@ class MeasureMergedCoaddSourcesConfig(Config):
         target=CatalogCalculationTask,
         doc="Subtask to run catalogCalculation plugins on catalog"
     )
+    psfCache = Field(
+        dtype=int,
+        defaut=100,
+        doc="Number of psfs to keep in cache"
+    )
+    exposure = InputDatasetField(
+        doc = "Exposure on which measurements are to be made",
+        name="deepCoadd_calexp",
+        storageClass="Exposure",
+        units=("Tract", "Patch", "Filter")
+    )
+    sources =  InputDatasetField(
+        doc = "The input catalog of merged sources",
+        name = "deepCoadd_{}",
+        storageClass="SourceCatalog",
+        units=("Tract", "Patch", "Filter")
+    )
+    referenceLoader = InitReferenceObjectLoader() # This is a stand in for now that tells the middleware
+                                                  # system that a referenceObjectLoader should be given to
+                                                  # this task
+    matches = OutputDatasetField(
+        doc = "Catalog of matches produced by the matcher",
+        name = "deepCoadd_measMatch"
+        storageClass="SouceCatalog",
+        units=("Tract", "Patch", "Filter")
+    )
+    denormMatches = OutputDatasetField(
+        doc = "Denormalized Catalog of matches produced by the matcher",
+        name = "deepCoadd_measMatchFull"
+        storageClass="SouceCatalog",
+        units=("Tract", "Patch", "Filter")
+    )
+    outputSources = OutputDatasetField(
+        doc = "Source catalog returned after measurements are made",
+        name = "deepCoadd_meas"
+        storageClass="SourceCatalog",
+        units=("Tract", "Patch", "Filter")
+    )
 
     def setDefaults(self):
         Config.setDefaults(self)
@@ -55,30 +93,17 @@ class MeasureMergedCoaddSourcesConfig(Config):
 
 
 
-class MeasureMergedCoaddSourcesTask(CmdLineTask):
+class MeasureMergedCoaddSourcesTask(PipelineTask):
     _DefaultName = "measureCoaddSources"
     ConfigClass = MeasureMergedCoaddSourcesConfig
-    RunnerClass = MeasureMergedCoaddSourcesRunner
     getSchemaCatalogs = _makeGetSchemaCatalogs("meas")
     makeIdFactory = _makeMakeIdFactory("MergedCoaddId")  # The IDs we already have are of this type
 
-    @classmethod
-    def _makeArgumentParser(cls):
-        parser = ArgumentParser(name=cls._DefaultName)
-        parser.add_id_argument("--id", "deepCoadd_calexp",
-                               help="data ID, e.g. --id tract=12345 patch=1,2 filter=r",
-                               ContainerClass=ExistingCoaddDataIdContainer)
-        parser.add_argument("--psfCache", type=int, default=100, help="Size of CoaddPsf cache")
-        return parser
-
-    def __init__(self, butler=None, schema=None, peakSchema=None, refObjLoader=None, **kwargs):
-        CmdLineTask.__init__(self, **kwargs)
+    def __init__(self, config=None, log=None, initInputs=None):
+        # initInputs = {"schema":None, "peakSchema":None, "refObjLoader":None}
         self.deblended = self.config.inputCatalog.startswith("deblended")
         self.inputCatalog = "Coadd_" + self.config.inputCatalog
-        if schema is None:
-            assert butler is not None, "Neither butler nor schema is defined"
-            schema = butler.get(self.config.coaddName + self.inputCatalog + "_schema", immediate=True).schema
-        self.schemaMapper = afwTable.SchemaMapper(schema)
+        self.schemaMapper = afwTable.SchemaMapper(initInputs["schema"])
         self.schemaMapper.addMinimalSchema(schema)
         self.schema = self.schemaMapper.getOutputSchema()
         self.algMetadata = PropertyList()
@@ -87,7 +112,8 @@ class MeasureMergedCoaddSourcesTask(CmdLineTask):
         if self.config.doMatchSources:
             if refObjLoader is None:
                 assert butler is not None, "Neither butler nor refObjLoader is defined"
-            self.makeSubtask("match", butler=butler, refObjLoader=refObjLoader)
+        self.makeSubtask("match") # Assuming the match subtask has been reworked to not take a buttler, and to
+                                  # have the reference loader passed in later
         if self.config.doPropagateFlags:
             self.makeSubtask("propagateFlags", schema=self.schema)
         self.schema.checkUnits(parse_strict=self.config.checkUnitsParseStrict)
@@ -96,14 +122,19 @@ class MeasureMergedCoaddSourcesTask(CmdLineTask):
         if self.config.doRunCatalogCalculation:
             self.makeSubtask("catalogCalculation", schema=self.schema)
 
-    def runDataRef(self, patchRef, psfCache=100):
-        exposure = patchRef.get(self.config.coaddName + "Coadd_calexp", immediate=True)
+    def run(self, exposure, sources, referenceLoader):
+        psfCache = self.config.psfCache
+
+        self.match.setReferenceLoader(referenceLoader) # This assumes this method has already been added to
+                                                       # the matcher
+
         exposure.getPsf().setCacheCapacity(psfCache)
-        sources = self.readSources(patchRef)
+        sources = self.formatSources(sources)
         table = sources.getTable()
         table.setMetadata(self.algMetadata)  # Capture algorithm metadata to write out to the source catalog.
 
-        self.measurement.run(sources, exposure, exposureId=self.getExposureId(patchRef))
+        self.measurement.run(sources, exposure, _______) # assume this task has been updated to be compatible
+                                                         # with pipeline tasks
 
         if self.config.doApCorr:
             self.applyApCorr.run(
@@ -121,20 +152,23 @@ class MeasureMergedCoaddSourcesTask(CmdLineTask):
         if self.config.doRunCatalogCalculation:
             self.catalogCalculation.run(sources)
 
-        skyInfo = getSkyInfo(coaddName=self.config.coaddName, patchRef=patchRef)
-        self.setPrimaryFlags.run(sources, skyInfo.skyMap, skyInfo.tractInfo, skyInfo.patchInfo,
-                                 includeDeblend=self.deblended)
+        self.setPrimaryFlags.run(sources,  ________) # This is assumed to be a converted task with all
+                                                     # associated problems solved
         if self.config.doPropagateFlags:
-            self.propagateFlags.run(patchRef.getButler(), sources, self.propagateFlags.getCcdInputs(exposure),
-                                    exposure.getWcs())
-        if self.config.doMatchSources:
-            self.writeMatches(patchRef, exposure, sources)
-        self.write(patchRef, sources)
+            self.propagateFlags.run(________) # Assume this is also a converted task with all problems solved
 
-    def readSources(self, dataRef):
-        merged = dataRef.get(self.config.coaddName + self.inputCatalog, immediate=True)
-        self.log.info("Read %d detections: %s" % (len(merged), dataRef.dataId))
-        idFactory = self.makeIdFactory(dataRef)
+        returnStruct = Struct()
+        if self.config.doMatchSources:
+            catalogMatches, denormCatalogMatches = self.prepWriteMatches(patchRef, exposure, sources)
+            if catalogMatches:
+                returnStruct.matches = catalogMatches
+            if denormCatalogMatches:
+                returnStruct.denormMatches
+        returnStruct.outputSources = sources
+        return retunStruct
+
+    def formatSources(self, merged):
+        idFactory = self.makeIdFactory(_______) # This assumes idFactory has been updated
         for s in merged:
             idFactory.notify(s.getId())
         table = afwTable.SourceTable.make(self.schema, idFactory)
@@ -142,20 +176,33 @@ class MeasureMergedCoaddSourcesTask(CmdLineTask):
         sources.extend(merged, self.schemaMapper)
         return sources
 
-    def writeMatches(self, dataRef, exposure, sources):
+    def prepWriteMatches(self, dataRef, exposure, sources):
         result = self.match.run(sources, exposure.getInfo().getFilter().getName())
-        if result.matches:
-            matches = afwTable.packMatches(result.matches)
-            matches.table.setMetadata(result.matchMeta)
-            dataRef.put(matches, self.config.coaddName + "Coadd_measMatch")
-            if self.config.doWriteMatchesDenormalized:
-                denormMatches = denormalizeMatches(result.matches, result.matchMeta)
-                dataRef.put(denormMatches, self.config.coaddName + "Coadd_measMatchFull")
+        matches = afwTable.packMatches(result.matches)
+        matches.table.setMetadata(result.matchMeta)
+        denormMatches = None
+        if self.config.doWriteMatchesDenormalized:
+            denormMatches = denormalizeMatches(result.matches, result.matchMeta)
+        return matches, denormMatches
 
-    def write(self, dataRef, sources):
-        dataRef.put(sources, self.config.coaddName + "Coadd_meas")
-        self.log.info("Wrote %d sources: %s" % (len(sources), dataRef.dataId))
+    @classmethod
+    def getInitInputDatasetTypes(cls, config):
+        inputTypeDict = super().getInitInputDatasetTypes(config)
+        inputTypeDict['schema'] = InitInputDatasetField(
+            doc="Schema used to initialize measurement catalog"
+            name="deep{}_schema".format(config.inputCatalog) 
+            storageClass="Schema"
+        )
+        inputTypeDict['sources'].name = inputTypeDict['sources'].name.format(config.inputCatalog)
+        return inputTypeDict
 
-    def getExposureId(self, dataRef):
-        return int(dataRef.get(self.config.coaddName + "CoaddId"))
+
+    @classmethod
+    def getOutputDatasetTypes(cls, config):
+        outputTypeDict = super().getOutputDatasetTypes(config)
+        if config.doMatchSources is False:
+            outputTypeDict.pop('matches')
+        if config.doWriteMatchesDenormalized is False:
+            outputTypeDict.pop('denormMatches')
+        return outputTypeDict
 
